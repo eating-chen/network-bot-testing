@@ -824,6 +824,10 @@ dependencies = [
 pdf = [
     { name = "docling" },
 ]
+sft = [
+    { name = "transformers", version = "5.8.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "transformers", version = "5.16.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin'" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -837,8 +841,9 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.30,<2" },
     { name = "pyarrow", specifier = ">=18,<24" },
     { name = "tqdm", specifier = ">=4.67,<5" },
+    { name = "transformers", marker = "extra == 'sft'", specifier = ">=4.51,<6" },
 ]
-provides-extras = ["pdf"]
+provides-extras = ["pdf", "sft"]
 
 [package.metadata.requires-dev]
 dev = [

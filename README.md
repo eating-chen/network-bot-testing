@@ -1,4 +1,16 @@
-# Network CPT v1：網路領域持續預訓練資料前處理
+# Network training data：CPT 與 Agentic SFT 前處理
+
+本 repository 有兩條互相分離的 pipeline：
+
+- `network_cpt/`：document/text 格式的持續預訓練資料，使用既有 `data/raw`、
+  `data/interim`、`data/processed/network_cpt_v1`。
+- `network_sft/`：model-neutral `system/tools/turns` JSONL，只使用 `data/sft/`；
+  model/API message wrapper 僅存在於 adapters。
+
+本頁以下說明 CPT。SFT 的來源、filter、逐支 Python 執行方式與輸出 schema 請看
+[Agentic SFT data guide](docs/sft_data_guide.md)。
+
+## CPT pipeline
 
 這個專案把 Network CPT v1 的原始資料處理到 document-level
 `train / validation / test` split。專案採用
