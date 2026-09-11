@@ -4,11 +4,12 @@
 
 - `network_cpt/`：document/text 格式的持續預訓練資料，使用既有 `data/raw`、
   `data/interim`、`data/processed/network_cpt_v1`。
-- `network_sft/`：model-neutral `system/tools/turns` JSONL，只使用 `data/sft/`；
-  model/API message wrapper 僅存在於 adapters。
+- `network_sft/`：六來源、約 15k 筆的 Diagnostic/Agentic Mixed SFT V1；使用
+  model-neutral Hugging Face/TRL `messages + tools` JSONL，只讀寫 `data/sft/`。
 
 本頁以下說明 CPT。SFT 的來源、filter、逐支 Python 執行方式與輸出 schema 請看
-[Agentic SFT data guide](docs/sft_data_guide.md)。
+[Agentic SFT data guide](docs/sft_data_guide.md)；要逐檔理解函式與資料如何流動，請看
+[Network SFT 程式導讀](docs/network_sft_code_guide.md)。
 
 ## CPT pipeline
 

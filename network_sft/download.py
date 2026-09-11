@@ -1,6 +1,4 @@
-"""Download raw SFT sources into data/sft/raw; never touches CPT data."""
-
-from __future__ import annotations
+"""Download the six raw sources. Existing snapshots are reused."""
 
 import hashlib
 import logging
@@ -13,86 +11,93 @@ from typing import Any
 from huggingface_hub import HfApi, snapshot_download
 
 from network_sft import config
-from network_sft.io import setup_logging, utc_now, write_json
+from network_sft.io import setup_logging, source_files, utc_now, write_json
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _download_hf(name: str, repo_id: str, patterns: list[str]) -> dict[str, Any]:
+def _hf_source(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     destination = config.RAW_DIR / name
-    if list(destination.rglob("*.parquet")) or list(destination.rglob("*.jsonl")):
-        LOGGER.info("沿用既有 Hugging Face snapshot: %s", destination)
-        return {"dataset_id": repo_id, "path": str(destination), "reused": True}
-
-    revision = HfApi().dataset_info(repo_id).sha
-    LOGGER.info("下載 %s@%s", repo_id, revision)
+    if source_files(destination):
+        LOGGER.info("reuse raw/%s", name)
+        cached = destination / ".cache" / "huggingface" / "trees"
+        revisions = sorted(path.stem for path in cached.glob("*.json"))
+        return {
+            "repo_id": spec["repo_id"],
+            "cached_revisions": revisions,
+            "path": str(destination),
+            "reused": True,
+        }
+    revision = HfApi().dataset_info(spec["repo_id"]).sha
     snapshot_download(
-        repo_id=repo_id,
+        repo_id=spec["repo_id"],
         repo_type="dataset",
         revision=revision,
-        allow_patterns=patterns,
+        allow_patterns=spec["patterns"],
         local_dir=destination,
     )
+    data_revision = revision
+    if not source_files(destination):
+        # Some dataset repos only keep a card on main; the viewer materializes data here.
+        data_revision = HfApi().dataset_info(spec["repo_id"], revision="refs/convert/parquet").sha
+        snapshot_download(
+            repo_id=spec["repo_id"],
+            repo_type="dataset",
+            revision=data_revision,
+            allow_patterns=["**/*.parquet"],
+            local_dir=destination,
+        )
+    if not source_files(destination):
+        raise RuntimeError(f"downloaded no supported data files for {name}")
     return {
-        "dataset_id": repo_id,
-        "revision": revision,
+        "repo_id": spec["repo_id"],
+        "main_revision": revision,
+        "data_revision": data_revision,
         "path": str(destination),
         "reused": False,
     }
 
 
 def _md5(path: Path) -> str:
-    digest = hashlib.md5()  # noqa: S324 - verifies the upstream published checksum only.
+    digest = hashlib.md5()  # noqa: S324 - checking the publisher's checksum
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def _download_nika() -> dict[str, Any]:
+def _nika() -> dict[str, Any]:
     archive = config.RAW_DIR / "nika_traces.zip"
     destination = config.RAW_DIR / "nika"
     if not archive.exists():
         archive.parent.mkdir(parents=True, exist_ok=True)
-        temporary = archive.with_suffix(".zip.part")
-        LOGGER.info("下載 NIKA traces")
-        request = urllib.request.Request(config.NIKA_URL, headers={"User-Agent": "network-sft/0.1"})
-        with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as out:
-            shutil.copyfileobj(response, out)
+        temporary = archive.with_suffix(".part")
+        request = urllib.request.Request(config.NIKA_URL, headers={"User-Agent": "network-sft-v1"})
+        with (
+            urllib.request.urlopen(request, timeout=120) as response,
+            temporary.open("wb") as output,
+        ):
+            shutil.copyfileobj(response, output)
         temporary.replace(archive)
     if _md5(archive) != config.NIKA_MD5:
         raise RuntimeError(f"NIKA checksum mismatch: {archive}")
-
     marker = destination / ".extracted"
     if not marker.exists():
         destination.mkdir(parents=True, exist_ok=True)
-        root = destination.resolve()
+        safe_root = destination.resolve()
         with zipfile.ZipFile(archive) as bundle:
             for member in bundle.infolist():
-                target = (destination / member.filename).resolve()
-                if not target.is_relative_to(root):
-                    raise RuntimeError(f"Unsafe zip member: {member.filename}")
+                if not (destination / member.filename).resolve().is_relative_to(safe_root):
+                    raise RuntimeError(f"unsafe ZIP member: {member.filename}")
             bundle.extractall(destination)
         marker.write_text("ok\n", encoding="utf-8")
     return {"url": config.NIKA_URL, "md5": config.NIKA_MD5, "path": str(destination)}
 
 
 def run_download() -> dict[str, Any]:
-    manifest = {
-        "stage": "sft_download",
-        "created_at": utc_now(),
-        "general_sft": _download_hf(
-            "general_sft",
-            config.GENERAL_DATASET_ID,
-            [f"data/{config.GENERAL_SOURCE_SPLIT}-*.parquet", "README.md"],
-        ),
-        "functiongemma_network": _download_hf(
-            "functiongemma_network",
-            config.FUNCTIONGEMMA_DATASET_ID,
-            [f"data/{config.FUNCTIONGEMMA_CONFIG}/*.jsonl", "README.md"],
-        ),
-        "nika": _download_nika(),
-    }
+    sources = {name: _hf_source(name, spec) for name, spec in config.HF_SOURCES.items()}
+    sources["nika"] = _nika()
+    manifest = {"created_at": utc_now(), "sources": sources}
     write_json(config.RAW_DIR / "download_manifest.json", manifest)
     return manifest
 

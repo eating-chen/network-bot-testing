@@ -1,7 +1,6 @@
-"""Small IO helpers shared only by the SFT pipeline."""
+"""Small, boring IO helpers shared by the SFT stages."""
 
-from __future__ import annotations
-
+import csv
 import hashlib
 import json
 import logging
@@ -14,10 +13,7 @@ import pyarrow.parquet as pq
 
 
 def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
 
 def stable_id(*parts: object, length: int = 24) -> str:
@@ -25,14 +21,18 @@ def stable_id(*parts: object, length: int = 24) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:length]
 
 
+def stable_score(*parts: object) -> str:
+    return hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
+def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -48,22 +48,35 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
 
 
 def jsonl_rows(path: Path) -> Iterator[dict[str, Any]]:
-    # utf-8-sig accepts ordinary UTF-8 and FunctionGemma's leading BOM.
     with path.open(encoding="utf-8-sig") as handle:
-        for line_number, line in enumerate(handle, start=1):
+        for number, line in enumerate(handle, 1):
             if not line.strip():
                 continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"{path}:{line_number} invalid JSON") from error
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")
-            yield row
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"{path}:{number} is not an object")
+            yield value
 
 
-def upstream_parquet_rows(path: Path) -> Iterator[dict[str, Any]]:
-    """Read an upstream Parquet shard; canonical outputs are always JSONL."""
-    parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=1_000):
-        yield from batch.to_pylist(maps_as_pydicts="strict")
+def data_rows(path: Path) -> Iterator[dict[str, Any]]:
+    if path.suffix == ".parquet":
+        parquet = pq.ParquetFile(path)
+        for batch in parquet.iter_batches(batch_size=1_000):
+            yield from batch.to_pylist(maps_as_pydicts="strict")
+    elif path.suffix == ".jsonl":
+        yield from jsonl_rows(path)
+    elif path.suffix == ".csv":
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            yield from csv.DictReader(handle)
+    elif path.suffix == ".json":
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(value, list):
+            raise ValueError(f"Expected a JSON array: {path}")
+        yield from value
+
+
+def source_files(root: Path) -> list[Path]:
+    suffixes = {".csv", ".json", ".jsonl", ".parquet"}
+    return sorted(
+        path for path in root.rglob("*") if path.suffix in suffixes and ".cache" not in path.parts
+    )

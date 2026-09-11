@@ -1,28 +1,18 @@
-"""Run SFT data preparation from download through final Parquet files."""
+"""Run V1 in the same order shown in the plan."""
 
-from __future__ import annotations
-
-from network_sft import config
+from network_sft.curate import run_curate
 from network_sft.download import run_download
-from network_sft.functiongemma import run_functiongemma
-from network_sft.general import run_general
 from network_sft.io import setup_logging
-from network_sft.nika import run_nika
-from network_sft.split_merge import run_split_merge
+from network_sft.normalize import run_normalize
+from network_sft.split import run_split
 from network_sft.stats import run_stats
-from network_sft.validate import run_validate
 
 
 def run_pipeline() -> None:
     run_download()
-    run_general()
-    run_functiongemma()
-    run_nika()
-    run_validate()
-    run_split_merge()
-    run_validate(
-        [config.CANONICAL_DIR / f"{split}.jsonl" for split in ("train", "validation", "test")]
-    )
+    run_normalize()
+    run_curate()  # quality -> exact/near dedup + group_id -> sampling
+    run_split()
     run_stats()
 
 

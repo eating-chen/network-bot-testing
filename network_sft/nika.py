@@ -1,78 +1,118 @@
-"""Parse successful NIKA event traces into canonical agentic SFT conversations."""
-
-from __future__ import annotations
+"""Turn one successful NIKA incident log into one canonical trajectory."""
 
 import ast
 import json
-import logging
 import re
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from network_sft import config
-from network_sft.io import setup_logging, write_json, write_jsonl
-from network_sft.schema import canonical_row
+from network_sft.io import stable_id
+from network_sft.schema import make_row, normalize_tool, text
 
-LOGGER = logging.getLogger(__name__)
 ERROR_EVENTS = {"chain_error", "llm_error", "tool_error", "fatal_error"}
 OUTPUT_NAME = re.compile(r"\bname=['\"]([^'\"]+)['\"]")
-OUTPUT_CONTENT = re.compile(r"^content=(?P<value>'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")", re.DOTALL)
+OUTPUT_CONTENT = re.compile(r"^content=(?P<v>'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")", re.DOTALL)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _object(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError(f"Expected JSON object: {path}")
+        raise ValueError(f"expected object: {path}")
     return value
 
 
-def _as_set(value: Any) -> set[str]:
+def _set(value: Any) -> set[str]:
     if isinstance(value, list):
         return {str(item) for item in value}
     return {str(value)} if value not in (None, "") else set()
 
 
-def submission_is_correct(ground_truth: dict[str, Any], submission: dict[str, Any]) -> bool:
-    return (
-        ground_truth.get("is_anomaly") == submission.get("is_anomaly")
-        and _as_set(ground_truth.get("faulty_devices"))
-        == _as_set(submission.get("faulty_devices"))
-        and _as_set(ground_truth.get("root_cause_name"))
-        == _as_set(submission.get("root_cause_name"))
-    )
+def evaluate_submission(truth: dict[str, Any], submission: dict[str, Any]) -> dict[str, Any]:
+    """Assign a traceable exact/partial/wrong tier without changing V1's strict gate."""
+    truth_devices = _set(truth.get("faulty_devices"))
+    submitted_devices = _set(submission.get("faulty_devices"))
+    truth_causes = _set(truth.get("root_cause_name"))
+    submitted_causes = _set(submission.get("root_cause_name"))
+    matches = {
+        "is_anomaly": truth.get("is_anomaly") == submission.get("is_anomaly"),
+        "faulty_devices_exact": truth_devices == submitted_devices,
+        "root_causes_exact": truth_causes == submitted_causes,
+    }
+    device_overlap = truth_devices & submitted_devices
+    cause_overlap = truth_causes & submitted_causes
+    if all(matches.values()):
+        tier = "exact_correct"
+    elif matches["is_anomaly"] and (
+        (matches["faulty_devices_exact"] and bool(cause_overlap))
+        or (matches["root_causes_exact"] and bool(device_overlap))
+    ):
+        tier = "partial_correct"
+    else:
+        tier = "wrong"
+    return {
+        "tier": tier,
+        "matches": matches,
+        "overlap": {
+            "faulty_devices": sorted(device_overlap),
+            "root_cause_name": sorted(cause_overlap),
+        },
+    }
+
+
+def audit_incident(path: Path) -> dict[str, Any]:
+    """Return the benchmark comparison needed to trace why an incident was kept."""
+    truth = _object(path / "ground_truth.json")
+    submission = _object(path / "submission.json")
+    issue, failure, incident = path.parts[-3:]
+    return {
+        "incident_path": str(path),
+        "incident_id": incident,
+        "issue_category": issue,
+        "failure_type": failure,
+        **evaluate_submission(truth, submission),
+        "ground_truth": {
+            "is_anomaly": truth.get("is_anomaly"),
+            "faulty_devices": sorted(_set(truth.get("faulty_devices"))),
+            "root_cause_name": sorted(_set(truth.get("root_cause_name"))),
+        },
+        "submission": {
+            "is_anomaly": submission.get("is_anomaly"),
+            "faulty_devices": sorted(_set(submission.get("faulty_devices"))),
+            "root_cause_name": sorted(_set(submission.get("root_cause_name"))),
+        },
+    }
 
 
 def _arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
-    if not isinstance(value, str):
-        raise ValueError("tool input is neither object nor string")
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         parsed = ast.literal_eval(value)
     if not isinstance(parsed, dict):
-        raise ValueError("tool input does not encode an object")
+        raise ValueError("tool input is not an object")
     return parsed
 
 
-def _tool_output(value: Any) -> str:
+def _output(value: Any) -> str:
     if not isinstance(value, str):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    match = OUTPUT_CONTENT.match(value)
-    if match:
+    if match := OUTPUT_CONTENT.match(value):
         try:
-            return str(ast.literal_eval(match.group("value")))
+            return str(ast.literal_eval(match.group("v")))
         except (SyntaxError, ValueError):
             pass
-    return value
+    return value.strip()
 
 
 def _json_type(value: Any) -> str:
     if isinstance(value, bool):
         return "boolean"
-    if isinstance(value, int | float):
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
         return "number"
     if isinstance(value, list):
         return "array"
@@ -81,185 +121,129 @@ def _json_type(value: Any) -> str:
     return "string"
 
 
-def _tool_schemas(observed: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    tools: list[dict[str, Any]] = []
-    for name in sorted(observed):
-        item = observed[name]
-        calls: list[dict[str, Any]] = item["calls"]
+def _tools(observed: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for name, item in sorted(observed.items()):
+        calls = item["calls"]
         keys = set().union(*(call.keys() for call in calls)) if calls else set()
         required = set.intersection(*(set(call) for call in calls)) if calls else set()
-        properties = {}
-        for key in sorted(keys):
-            sample = next((call[key] for call in calls if key in call), "")
-            properties[key] = {"type": _json_type(sample)}
-        tools.append(
-            {
-                "name": name,
-                "description": item["description"],
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": sorted(required),
-                    "additionalProperties": False,
-                },
-            }
+        properties = {
+            key: {"type": _json_type(next(call[key] for call in calls if key in call))}
+            for key in sorted(keys)
+        }
+        output.append(
+            normalize_tool(
+                {
+                    "name": name,
+                    "description": item["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": sorted(required),
+                    },
+                }
+            )
         )
-    return tools
+    return output
 
 
-def _events(path: Path) -> list[dict[str, Any]]:
-    events = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"{path}:{line_number} invalid JSON") from error
-        if not isinstance(event, dict):
-            raise ValueError(f"{path}:{line_number} is not a JSON object")
-        events.append(event)
-    return events
+def _events(path: Path):
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.strip():
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid event JSON at line {number}") from error
 
 
-def parse_incident(incident_dir: Path) -> dict[str, Any]:
-    ground_truth = _load_json(incident_dir / "ground_truth.json")
-    submission = _load_json(incident_dir / "submission.json")
-    if not submission_is_correct(ground_truth, submission):
-        raise ValueError("incorrect_submission")
-    session = _load_json(incident_dir / "session_meta.json")
-    task = str(session.get("task_description") or "").strip()
+def parse_incident(path: Path, *, accepted_tier: str = "exact_correct") -> dict[str, Any]:
+    if accepted_tier not in {"exact_correct", "partial_correct"}:
+        raise ValueError(f"unsupported positive tier: {accepted_tier}")
+    truth, submission = _object(path / "ground_truth.json"), _object(path / "submission.json")
+    evaluation = evaluate_submission(truth, submission)
+    if evaluation["tier"] != accepted_tier:
+        raise ValueError(f"{evaluation['tier']}_submission")
+    session = _object(path / "session_meta.json")
+    task = text(session.get("task_description"))
     if not task:
         raise ValueError("missing_task_description")
 
-    turns: list[dict[str, Any]] = [{"role": "user", "content": task}]
-    pending: list[dict[str, Any]] = []
-    active: list[dict[str, Any]] = []
-    pending_content: str | None = None
-    observed: dict[str, dict[str, Any]] = {}
-    call_number = 0
-
-    for event in _events(incident_dir / "conversation_diagnosis_agent.log"):
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": config.NIKA_SYSTEM},
+        {"role": "user", "content": task},
+    ]
+    pending, active, observed = [], [], {}
+    pending_content, call_number = "", 0
+    for event in _events(path / "conversation_diagnosis_agent.log"):
         kind = event.get("event")
         if kind in ERROR_EVENTS or event.get("invalid_tool_calls"):
             raise ValueError("fatal_or_invalid_tool_event")
         if kind == "llm_end":
-            text = str(event.get("text") or "").strip()
-            finish_reason = (event.get("generation_info") or {}).get("finish_reason")
-            if finish_reason == "tool_calls":
-                pending_content = text or None
-            elif text:
+            answer = text(event.get("text"))
+            if (event.get("generation_info") or {}).get("finish_reason") == "tool_calls":
+                pending_content = answer
+            elif answer:
                 if pending or active:
-                    raise ValueError("assistant_before_tool_group_complete")
-                turns.append({"role": "assistant", "content": text})
+                    raise ValueError("assistant_before_tools_complete")
+                messages.append({"role": "assistant", "content": answer})
         elif kind == "tool_start":
             tool = event.get("tool") or {}
-            name = str(tool.get("name") or "").strip()
+            name = text(tool.get("name"))
             if not name:
                 raise ValueError("missing_tool_name")
             arguments = _arguments(event.get("input") or {})
-            call_id = f"call_{call_number}"
-            call_number += 1
             call = {
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
+                "id": f"call_{call_number}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
             }
+            call_number += 1
             pending.append(call)
-            item = observed.setdefault(
-                name,
-                {"description": str(tool.get("description") or ""), "calls": []},
-            )
-            item["calls"].append(arguments)
+            observed.setdefault(name, {"description": text(tool.get("description")), "calls": []})[
+                "calls"
+            ].append(arguments)
         elif kind == "tool_end":
             if pending:
-                turns.append(
-                    {
-                        "role": "assistant",
-                        "content": pending_content or "",
-                        "tool_calls": pending.copy(),
-                    }
+                messages.append(
+                    {"role": "assistant", "content": pending_content, "tool_calls": pending.copy()}
                 )
                 active.extend(pending)
-                pending.clear()
-                pending_content = None
+                pending, pending_content = [], ""
             if not active:
                 raise ValueError("tool_result_without_call")
-            raw_output = event.get("output")
-            output_name = (
-                OUTPUT_NAME.search(raw_output or "") if isinstance(raw_output, str) else None
-            )
-            match_name = output_name.group(1) if output_name else None
-            position = next(
-                (i for i, call in enumerate(active) if call["name"] == match_name),
-                0,
-            )
+            raw = event.get("output")
+            match = OUTPUT_NAME.search(raw or "") if isinstance(raw, str) else None
+            name = match.group(1) if match else ""
+            matches = [
+                i for i, call in enumerate(active) if call["function"]["name"] == name
+            ]
+            if len(matches) != 1:
+                raise ValueError("ambiguous_tool_result")
+            position = matches[0]
             call = active.pop(position)
-            content = _tool_output(raw_output)
-            if not content.strip():
-                raise ValueError("empty_tool_output")
-            turns.append(
+            messages.append(
                 {
                     "role": "tool",
-                    "call_id": call["call_id"],
-                    "name": call["name"],
-                    "content": content,
+                    "name": call["function"]["name"],
+                    "tool_call_id": call["id"],
+                    "content": _output(raw),
                 }
             )
 
-    if pending or active or turns[-1]["role"] != "assistant":
+    if pending or active or messages[-1]["role"] != "assistant":
         raise ValueError("incomplete_trajectory")
-    parts = incident_dir.parts
-    issue_category, failure_type, incident_id = parts[-3:]
+    issue, failure, incident = path.parts[-3:]
     metadata = {
-        "failure_type": failure_type,
-        "scenario": str(session.get("scenario_name") or ""),
-        "issue_category": issue_category,
-        "faulty_devices": sorted(_as_set(ground_truth.get("faulty_devices"))),
-        "root_cause_name": sorted(_as_set(ground_truth.get("root_cause_name"))),
-        "is_anomaly": bool(ground_truth.get("is_anomaly")),
-        "success": True,
-        "incident_id": incident_id,
-        "backend_model": str(session.get("backend_model") or ""),
-        "scenario_topo_size": str(session.get("scenario_topo_size") or ""),
-        "original_source": "NIKA Traces v1 / Zenodo 17971675",
+        "original_id": incident,
+        "scenario": text(session.get("scenario_name")),
+        "issue_category": issue,
+        "failure_type": failure,
+        # Broad issue category is the split stratum; failure_type remains available below it.
+        "category": issue,
+        "faulty_devices": sorted(_set(truth.get("faulty_devices"))),
+        "root_cause": sorted(_set(truth.get("root_cause_name"))),
+        "submission_tier": evaluation["tier"],
+        "submission_matches": evaluation["matches"],
     }
-    return canonical_row(
-        f"nika_{incident_id}",
-        "nika",
-        "network_agent",
-        config.NIKA_SYSTEM_PROMPT,
-        _tool_schemas(observed),
-        turns,
-        metadata,
-    )
-
-
-def run_nika(root: Path | None = None, output: Path | None = None) -> dict[str, Any]:
-    root = root or config.RAW_DIR / "nika"
-    output = output or config.intermediate_path("nika")
-    incident_dirs = sorted(path.parent for path in root.rglob("ground_truth.json"))
-    rows: list[dict[str, Any]] = []
-    rejected: Counter[str] = Counter()
-    for incident_dir in incident_dirs:
-        if not (incident_dir / "submission.json").exists():
-            rejected["missing_submission"] += 1
-            continue
-        try:
-            rows.append(parse_incident(incident_dir))
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            rejected[str(error)] += 1
-    write_jsonl(output, rows)
-    manifest = {
-        "incidents": len(incident_dirs),
-        "output_rows": len(rows),
-        "rejected": dict(rejected),
-    }
-    write_json(config.REPORTS_DIR / "nika_stats.json", manifest)
-    LOGGER.info("NIKA 完成：accepted=%d rejected=%d", len(rows), sum(rejected.values()))
-    return manifest
-
-
-if __name__ == "__main__":
-    setup_logging()
-    run_nika()
+    identifier = f"nika_{stable_id(metadata['scenario'], issue, failure, incident)}"
+    return make_row(identifier, "nika", "agentic", messages, _tools(observed), metadata)
