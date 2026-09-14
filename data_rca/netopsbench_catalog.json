@@ -1,0 +1,110 @@
+{
+  "acl_misconfig": {
+    "cause": "ACL misconfiguration",
+    "domain": "security",
+    "protocol": "acl",
+    "preferred_tools": ["get_device_acl", "get_device_config", "ping_test", "traceroute"],
+    "reason": "The benchmark ground truth identifies an ACL rule or binding on the affected SONiC device as the fault.",
+    "resolution": ["Correct or remove the unintended ACL rule or interface binding on the affected device."],
+    "verification": [{"command": "get_device_acl on the affected device", "expected_result": "The unintended ACL is absent or corrected."}, {"command": "ping_test across the affected path", "expected_result": "Traffic is no longer denied."}]
+  },
+  "bgp_neighbor_misconfig": {
+    "cause": "BGP neighbor misconfiguration",
+    "domain": "routing",
+    "protocol": "bgp",
+    "preferred_tools": ["get_bgp_neighbor", "get_bgp_neighbors", "get_device_config", "query_bgp_events"],
+    "reason": "The benchmark ground truth identifies the affected device's BGP neighbor configuration as the fault.",
+    "resolution": ["Correct the BGP neighbor parameters on the affected SONiC device."],
+    "verification": [{"command": "get_bgp_neighbor or get_bgp_neighbors", "expected_result": "The affected BGP session is Established with the intended peer parameters."}]
+  },
+  "blackhole_route": {
+    "cause": "Blackhole route",
+    "domain": "routing",
+    "protocol": "ip",
+    "preferred_tools": ["get_route_table", "get_bgp_rib", "get_device_config", "ping_test"],
+    "reason": "The benchmark ground truth identifies a discard route on the affected device as the fault.",
+    "resolution": ["Remove or correct the unintended discard route on the affected SONiC device."],
+    "verification": [{"command": "get_route_table", "expected_result": "The intended forwarding route is selected instead of a discard route."}, {"command": "ping_test", "expected_result": "Reachability through the affected path is restored."}]
+  },
+  "device_down": {
+    "cause": "Network device unavailable",
+    "domain": "system",
+    "protocol": "",
+    "preferred_tools": ["get_device_interfaces", "get_device_logs", "get_topology", "get_pingmesh_summary"],
+    "reason": "The benchmark ground truth identifies the target SONiC device as unavailable.",
+    "resolution": ["Restore the affected SONiC device and its network services."],
+    "verification": [{"command": "get_device_interfaces", "expected_result": "The device responds and expected interfaces report operational state."}, {"command": "get_pingmesh_summary", "expected_result": "Paths through the restored device recover."}]
+  },
+  "high_latency": {
+    "cause": "Excessive link latency",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_interface_metrics", "get_pingmesh_hotspots", "get_pingmesh_summary", "traceroute"],
+    "reason": "The benchmark ground truth identifies excessive delay on the affected interface.",
+    "resolution": ["Remove the unintended delay impairment or repair the affected link."],
+    "verification": [{"command": "get_pingmesh_hotspots", "expected_result": "Latency on paths using the affected link returns to the expected range."}]
+  },
+  "link_down": {
+    "cause": "Link down",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_device_interfaces", "get_interface_metrics", "get_device_logs", "get_pingmesh_summary"],
+    "reason": "The benchmark ground truth identifies the affected interface as down.",
+    "resolution": ["Restore or enable the affected link and correct the underlying physical or administrative condition."],
+    "verification": [{"command": "get_device_interfaces", "expected_result": "The affected interface is administratively and operationally up."}, {"command": "get_pingmesh_summary", "expected_result": "Traffic paths using the link recover."}]
+  },
+  "link_flapping": {
+    "cause": "Link flapping",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_device_logs", "get_device_interfaces", "get_interface_metrics", "query_bgp_events"],
+    "reason": "The benchmark ground truth identifies repeated state changes on the affected interface.",
+    "resolution": ["Stabilize the affected link and remove the condition causing repeated state transitions."],
+    "verification": [{"command": "get_device_logs and get_device_interfaces", "expected_result": "The interface remains up without new flap events."}]
+  },
+  "mtu_mismatch": {
+    "cause": "Interface MTU mismatch",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_device_interfaces", "get_device_config", "ping_test", "get_interface_metrics"],
+    "reason": "The benchmark ground truth identifies an inconsistent MTU on the affected interface.",
+    "resolution": ["Configure a consistent intended MTU across the affected path."],
+    "verification": [{"command": "get_device_interfaces", "expected_result": "The affected interface reports the intended MTU."}, {"command": "ping_test with the intended DF payload", "expected_result": "Large packets traverse the path successfully."}]
+  },
+  "packet_corruption": {
+    "cause": "Packet corruption on a link",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_interface_metrics", "get_device_interfaces", "get_pingmesh_hotspots", "get_device_logs"],
+    "reason": "The benchmark ground truth identifies packet corruption on the affected interface.",
+    "resolution": ["Remove the corruption impairment or repair the affected link and transceiver path."],
+    "verification": [{"command": "get_interface_metrics", "expected_result": "Error and corruption indicators stop increasing."}, {"command": "get_pingmesh_summary", "expected_result": "End-to-end traffic returns to the expected quality."}]
+  },
+  "packet_loss": {
+    "cause": "Packet loss on a link",
+    "domain": "interfaces",
+    "protocol": "ethernet",
+    "preferred_tools": ["get_interface_metrics", "get_pingmesh_hotspots", "get_pingmesh_summary", "ping_test"],
+    "reason": "The benchmark ground truth identifies packet loss on the affected interface.",
+    "resolution": ["Remove the loss impairment or repair the affected link."],
+    "verification": [{"command": "get_pingmesh_summary and ping_test", "expected_result": "Packet loss returns to the expected range."}]
+  },
+  "route_policy_misconfig": {
+    "cause": "Route policy misconfiguration",
+    "domain": "routing",
+    "protocol": "bgp",
+    "preferred_tools": ["get_device_config", "get_bgp_rib", "get_route_table", "get_bgp_neighbors"],
+    "reason": "The benchmark ground truth identifies a route policy on the affected device as the fault.",
+    "resolution": ["Correct the route policy and its BGP attachment on the affected SONiC device."],
+    "verification": [{"command": "get_bgp_rib and get_route_table", "expected_result": "Expected prefixes pass policy and are installed for forwarding."}]
+  },
+  "static_route_misconfig": {
+    "cause": "Static route misconfiguration",
+    "domain": "routing",
+    "protocol": "ip",
+    "preferred_tools": ["get_route_table", "get_device_config", "ping_test", "traceroute"],
+    "reason": "The benchmark ground truth identifies an incorrect static route on the affected device.",
+    "resolution": ["Correct or remove the unintended static route on the affected SONiC device."],
+    "verification": [{"command": "get_route_table", "expected_result": "The destination resolves through the intended next hop."}, {"command": "ping_test or traceroute", "expected_result": "The required path is restored."}]
+  }
+}

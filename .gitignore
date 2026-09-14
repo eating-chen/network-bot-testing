@@ -16,11 +16,13 @@ data/interim/**
 data/processed/**
 data/external/**
 data/sft/**
+data/rca/**
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
 !data/external/.gitkeep
 !data/sft/.gitkeep
+!data/rca/.gitkeep
 
 # Generated artifacts
 models/**
