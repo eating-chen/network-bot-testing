@@ -4,13 +4,14 @@ from pathlib import Path
 import pytest
 
 from network_sft import config
-from network_sft.curate import is_ccna_troubleshooting, network_topic, stratified_sample
+from network_sft.controlled import run_controlled
+from network_sft.curate import deterministic_sample, network_topic
 from network_sft.io import jsonl_rows, write_jsonl
 from network_sft.nika import evaluate_submission, parse_incident
 from network_sft.normalize import _decision_answer, normalize_toolace
 from network_sft.schema import make_row, normalize_tool, validate_row
 from network_sft.split import assign_groups
-from network_sft.stats import apply_template
+from network_sft.stats import _check_render, _error_category, apply_template
 
 PING = normalize_tool(
     {
@@ -111,7 +112,7 @@ def test_toolace_terminal_call_is_a_valid_sft_target() -> None:
     assert validate_row(row) == []
 
 
-def test_ccna_filter_and_topic() -> None:
+def test_ccna_topic_is_metadata_not_a_sampling_gate() -> None:
     row = make_row(
         "ccna-1",
         "ccna",
@@ -123,18 +124,19 @@ def test_ccna_filter_and_topic() -> None:
         [],
         {"category": "unclassified"},
     )
-    assert is_ccna_troubleshooting(row)
     assert network_topic(row["messages"][0]["content"]) == "routing_protocols"
 
 
-def test_sampling_redistributes_unused_quota() -> None:
+def test_simple_sampling_is_reproducible_and_has_no_category_quota() -> None:
     rows = []
     for index, category in enumerate(["a", "a", "a", "b", "b"]):
         row = agent_row(f"row-{index}", f"group-{index}")
         row["source"] = "fixture"
         row["metadata"]["category"] = category
         rows.append(row)
-    selected = stratified_sample(rows, 4, {"a": 1, "missing": 2}, "fixture")
+    selected = deterministic_sample(rows, 4, "fixture")
+    repeated = deterministic_sample(list(reversed(rows)), 4, "fixture")
+    assert [row["id"] for row in selected] == [row["id"] for row in repeated]
     assert len(selected) == 4
 
 
@@ -237,3 +239,61 @@ class MappingTokenizer(FakeTokenizer):
 
 def test_template_boundary_handles_transformers_v5_mapping_result() -> None:
     assert apply_template(MappingTokenizer(), agent_row()) == [4, 5, 6, 7]
+
+
+class JsonEscapingTokenizer:
+    def apply_chat_template(self, **kwargs):
+        messages = kwargs["conversation"]
+        return "\n".join(
+            [
+                messages[0]["content"],
+                "ping",
+                json.dumps(messages[2]["content"]),
+                messages[3]["content"],
+                "Ping a host.",
+            ]
+        )
+
+
+def test_template_check_accepts_json_escaped_tool_content() -> None:
+    row = agent_row()
+    row["messages"][2]["content"] = 'timeout\nreason="unreachable"'
+    _check_render(JsonEscapingTokenizer(), row)
+
+
+def test_template_failure_categories_do_not_embed_dynamic_tool_names() -> None:
+    assert _error_category("chat_template dropped tool call 'ping'") == (
+        "chat_template dropped tool call"
+    )
+
+
+def test_controlled_comparison_uses_same_compatible_ids(tmp_path: Path, monkeypatch) -> None:
+    final_dir = tmp_path / "master"
+    reports_dir = tmp_path / "reports"
+    controlled_dir = tmp_path / "controlled"
+    models = ("model-a", "model-b")
+    monkeypatch.setattr(config, "FINAL_DIR", final_dir)
+    monkeypatch.setattr(config, "REPORTS_DIR", reports_dir)
+    monkeypatch.setattr(config, "CONTROLLED_DIR", controlled_dir)
+    monkeypatch.setattr(config, "CONTROLLED_TOKENIZER_IDS", models)
+
+    rows = [agent_row("keep", "keep-group"), agent_row("drop", "drop-group")]
+    for row in rows:
+        row["metadata"]["split"] = "train"
+    write_jsonl(final_dir / "train.jsonl", rows)
+    write_jsonl(final_dir / "val.jsonl", [])
+    write_jsonl(final_dir / "test.jsonl", [])
+    reports_dir.mkdir(parents=True)
+    (reports_dir / "token_stats.json").write_text(
+        json.dumps({"tokenizers": {model: {"compatible_rows": 1} for model in models}})
+    )
+    write_jsonl(
+        reports_dir / "template_incompatible.jsonl",
+        [{"tokenizer_id": "model-b", "id": "drop", "source": "nika", "error": "no"}],
+    )
+
+    manifest = run_controlled()
+
+    assert [row["id"] for row in jsonl_rows(controlled_dir / "train.jsonl")] == ["keep"]
+    assert manifest["total_rows"] == 1
+    assert manifest["excluded_rows"] == 1

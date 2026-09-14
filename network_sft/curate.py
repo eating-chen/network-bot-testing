@@ -21,18 +21,6 @@ from network_sft.schema import validate_row
 
 LOGGER = logging.getLogger(__name__)
 WORDS = re.compile(r"[a-z0-9]+")
-TROUBLESHOOT = re.compile(
-    r"\b(cannot|can't|unable|fail(?:ed|ure|ing)?|down|unreachable|not working|not forming|"
-    r"incorrect|misconfigur\w*|troubleshoot\w*|diagnos\w*|verify|debug|issue|problem|"
-    r"timeout|drop(?:ped|ping)?|error|fix|resolve)\b",
-    re.I,
-)
-OPERATIONAL = re.compile(
-    r"\b(how|why|when|command|configur\w*|status|output|show|display|determine|identify|"
-    r"cause|enable|disable|reset|recover|state|neighbor|connect\w*|forward\w*|block\w*|"
-    r"shutdown|interface|counter|log|monitor)\b",
-    re.I,
-)
 TOPICS = {
     "routing_protocols": ("bgp", "ospf", "eigrp", "rip", "routing protocol", "neighbor"),
     "vlan_stp_l2": ("vlan", "stp", "spanning tree", "etherchannel", "switchport", "layer 2"),
@@ -59,20 +47,6 @@ def network_topic(value: str) -> str:
     scores = {topic: sum(term in lowered for term in terms) for topic, terms in TOPICS.items()}
     topic, score = max(scores.items(), key=lambda item: (item[1], item[0]))
     return topic if score else "management_cli_misc"
-
-
-def is_ccna_troubleshooting(row: dict[str, Any]) -> bool:
-    combined = " ".join(message.get("content", "") for message in row["messages"])
-    return bool(TROUBLESHOOT.search(combined))
-
-
-def ccna_candidate_tier(row: dict[str, Any]) -> str | None:
-    combined = " ".join(message.get("content", "") for message in row["messages"])
-    if TROUBLESHOOT.search(combined):
-        return "strict_troubleshooting"
-    if OPERATIONAL.search(combined):
-        return "operational_high_recall"
-    return None
 
 
 def _fingerprint(row: dict[str, Any]) -> str:
@@ -146,7 +120,7 @@ def _curate_sources() -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
                 row["metadata"]["category"] = network_topic(_first_user(row))
             errors = validate_row(row)
             if source == "toolace" and row["metadata"]["category"] == "no_tool":
-                errors.append("ToolACE no-tool row is outside V1 complexity strata")
+                errors.append("ToolACE no-tool row is outside the V1 positive tool-use pool")
             fingerprint = _fingerprint(row)
             if fingerprint in exact_seen:
                 errors.append(f"exact duplicate of {exact_seen[fingerprint]}")
@@ -171,65 +145,33 @@ def _curate_sources() -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     return accepted, report
 
 
-def stratified_sample(
-    rows: list[dict[str, Any]], target: int, quotas: dict[str, int], source: str
+def deterministic_sample(
+    rows: list[dict[str, Any]], target: int, source: str
 ) -> list[dict[str, Any]]:
+    """Take a reproducible simple sample without category quotas or oversampling."""
     ordered = sorted(rows, key=lambda row: stable_score(config.SEED, source, row["id"]))
-    by_category: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in ordered:
-        by_category[row["metadata"]["category"]].append(row)
-    selected = []
-    for category, quota in quotas.items():
-        selected.extend(by_category[category][:quota])
-    selected_ids = {row["id"] for row in selected}
-    remaining = [row for row in ordered if row["id"] not in selected_ids]
-    selected.extend(remaining[: max(0, min(target, len(rows)) - len(selected))])
-    return sorted(selected, key=lambda row: stable_score(config.SEED, "selected", row["id"]))
+    return ordered[: min(target, len(ordered))]
 
 
 def run_curate() -> dict[str, Any]:
     sources, report = _curate_sources()
-    ccna_candidates = []
-    for row in sources["ccna"]:
-        if tier := ccna_candidate_tier(row):
-            row["metadata"]["candidate_tier"] = tier
-            ccna_candidates.append(row)
     selected = []
     selected.extend(sources["5g_faults"])
     selected.extend(sources["telelogs"])
-    selected.extend(
-        stratified_sample(
-            ccna_candidates, config.SAMPLE_TARGETS["ccna"], config.CCNA_QUOTAS, "ccna"
-        )
-    )
+    selected.extend(sources["ccna"])
     selected.extend(sources["nika"])
     selected.extend(
-        stratified_sample(
-            sources["toolace"],
-            config.SAMPLE_TARGETS["toolace"],
-            config.TOOLACE_QUOTAS,
-            "toolace",
-        )
+        deterministic_sample(sources["toolace"], config.SAMPLE_TARGETS["toolace"], "toolace")
     )
     selected.extend(
-        stratified_sample(
-            sources["when2call"],
-            config.SAMPLE_TARGETS["when2call"],
-            config.WHEN2CALL_QUOTAS,
-            "when2call",
+        deterministic_sample(
+            sources["when2call"], config.SAMPLE_TARGETS["when2call"], "when2call"
         )
     )
     selected.sort(key=lambda row: stable_score(config.SEED, "mixed", row["id"]))
     write_jsonl(config.SELECTED_DIR / "selected.jsonl", selected)
 
-    chosen_ccna = [row for row in selected if row["source"] == "ccna"]
-    review = sorted(chosen_ccna, key=lambda row: stable_score(config.SEED, "review", row["id"]))
-    write_jsonl(config.REPORTS_DIR / "ccna_review_200.jsonl", review[: config.REVIEW_ROWS])
     counts = Counter((row["source"], row["metadata"]["category"]) for row in selected)
-    report["ccna_candidates"] = len(ccna_candidates)
-    report["ccna_candidate_tiers"] = dict(
-        Counter(row["metadata"]["candidate_tier"] for row in ccna_candidates)
-    )
     report["selected_rows"] = len(selected)
     report["selected_by_source"] = dict(Counter(row["source"] for row in selected))
     report["selected_by_capability"] = dict(
@@ -238,27 +180,14 @@ def run_curate() -> dict[str, Any]:
     report["selected_by_source_category"] = {
         f"{source}/{category}": count for (source, category), count in sorted(counts.items())
     }
-    sample_pools = {
-        "ccna": ccna_candidates,
-        "toolace": sources["toolace"],
-        "when2call": sources["when2call"],
-    }
-    report["available_by_source_category"] = {
-        source: dict(Counter(row["metadata"]["category"] for row in rows))
-        for source, rows in sample_pools.items()
-    }
-    report["quota_shortfalls"] = {
+    report["sampling"] = {
         source: {
-            category: max(
-                0, quota - report["available_by_source_category"][source].get(category, 0)
-            )
-            for category, quota in quotas.items()
+            "method": "deterministic_hash_sample",
+            "available": len(sources[source]),
+            "target": config.SAMPLE_TARGETS[source],
+            "selected": sum(row["source"] == source for row in selected),
         }
-        for source, quotas in {
-            "ccna": config.CCNA_QUOTAS,
-            "toolace": config.TOOLACE_QUOTAS,
-            "when2call": config.WHEN2CALL_QUOTAS,
-        }.items()
+        for source in config.SAMPLE_TARGETS
     }
     write_json(config.REPORTS_DIR / "curation.json", report)
     LOGGER.info("selected: %s", report["selected_by_source"])

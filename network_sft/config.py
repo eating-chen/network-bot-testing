@@ -10,6 +10,7 @@ CURATED_DIR = DATA_DIR / "02_curated"
 SELECTED_DIR = DATA_DIR / "03_selected"
 FINAL_DIR = DATA_DIR / "network_sft_v1"
 REPORTS_DIR = DATA_DIR / "reports"
+CONTROLLED_DIR = DATA_DIR / "experiments" / "controlled_llama_qwen"
 
 # snapshot_download keeps the exact Hub revision in download_manifest.json.
 HF_SOURCES = {
@@ -41,39 +42,20 @@ NIKA_MD5 = "cc940a7fadd29677d5ef942847a5c45c"
 NIKA_SYSTEM = "You are a network troubleshooting assistant."
 
 SOURCE_ORDER = ("5g_faults", "telelogs", "ccna", "nika", "toolace", "when2call")
-FULL_SOURCES = ("5g_faults", "telelogs", "nika")
-SAMPLE_TARGETS = {"ccna": 3_500, "toolace": 3_000, "when2call": 2_000}
-
-CCNA_QUOTAS = {
-    "ip_routing": 700,
-    "routing_protocols": 650,
-    "vlan_stp_l2": 600,
-    "acl_nat_security": 550,
-    "network_services": 500,
-    "management_cli_misc": 500,
-}
-TOOLACE_QUOTAS = {
-    "single_tool": 750,
-    "sequential": 1_050,
-    "multi_turn": 750,
-    "parallel": 450,
-}
-WHEN2CALL_QUOTAS = {
-    "tool_call": 700,
-    "direct_answer": 500,
-    "ask_clarification": 500,
-    "cannot_solve": 300,
-}
+SAMPLE_TARGETS = {"toolace": 3_000, "when2call": 2_000}
 
 SEED = 42
 SPLIT_RATIOS = {"train": 0.80, "val": 0.10, "test": 0.10}
 NEAR_DUP_JACCARD = 0.86
-REVIEW_ROWS = 200
 
-# stats.py records incompatibilities; these are checks, not corpus formatting.
-TOKENIZER_IDS = (
+# These models must train on exactly the same row IDs in the controlled experiment.
+CONTROLLED_TOKENIZER_IDS = (
     "Qwen/Qwen2.5-7B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
+)
+
+# Extra tokenizers may be audited without changing the controlled experiment.
+TOKENIZER_IDS = CONTROLLED_TOKENIZER_IDS + (
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
 )
 

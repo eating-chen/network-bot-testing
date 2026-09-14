@@ -1,5 +1,6 @@
 """Run V1 in the same order shown in the plan."""
 
+from network_sft.controlled import run_controlled
 from network_sft.curate import run_curate
 from network_sft.download import run_download
 from network_sft.io import setup_logging
@@ -14,6 +15,7 @@ def run_pipeline() -> None:
     run_curate()  # quality -> exact/near dedup + group_id -> sampling
     run_split()
     run_stats()
+    run_controlled()
 
 
 if __name__ == "__main__":

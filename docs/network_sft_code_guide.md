@@ -7,7 +7,7 @@
 
 ```text
 config.py
-   │ 共用路徑、來源、quota、seed
+   │ 共用路徑、來源、sample target、seed
    ▼
 download.py ────────────────> data/sft/raw/
    ▼
@@ -20,6 +20,9 @@ curate.py ──────────────────> data/sft/02_cu
 split.py ───────────────────> data/sft/network_sft_v1/{train,val,test}.jsonl
    ▼
 stats.py ───────────────────> data/sft/reports/token_stats.json
+         └──────────────────> data/sft/reports/template_incompatible.jsonl
+   ▼
+controlled.py ──────────────> data/sft/experiments/controlled_llama_qwen/
 
 io.py       每個 stage 共用的讀寫、stable ID 與 deterministic score
 pipeline.py 依上面順序呼叫全部 stage
@@ -37,8 +40,7 @@ pipeline.py 依上面順序呼叫全部 stage
    `unclassified`。
 3. `curate.py::_curate_sources()` 先用 `network_topic()` 補 category，再驗證 schema、移除 exact
    duplicate，並把 near duplicates 綁成同一個 `group_id`。
-4. `curate.py::ccna_candidate_tier()` 判斷它是否屬於 troubleshooting candidate；通過後才進
-   `stratified_sample()` 爭取 3,500 個名額。
+4. 所有通過 quality/dedup 的 CCNA rows 直接進 selected corpus；topic 只用於報表與 split。
 5. `split.py::assign_groups()` 以整個 `group_id` 為單位放入 train、val 或 test。
 6. `stats.py` 用每個 tokenizer 的原生 `chat_template` 實際 render，檢查內容和 tool schema
    有沒有被吃掉，並計算 token 統計。
@@ -52,15 +54,13 @@ pipeline.py 依上面順序呼叫全部 stage
   `NIKA_URL` 與 `NIKA_MD5`。
 - `SOURCE_ORDER`：quality/dedup 的處理順序。因為 exact dedup 是先到先保留，所以
   network-specific sources 放前面。
-- `FULL_SOURCES`：語意是「不做人為抽樣」；仍然會過 validity 和 dedup。
-- `SAMPLE_TARGETS`：CCNA、ToolACE、When2Call 的最終 row 目標。
-- `CCNA_QUOTAS`、`TOOLACE_QUOTAS`、`WHEN2CALL_QUOTAS`：各 source 的分層抽樣目標。
+- `SAMPLE_TARGETS`：只有 ToolACE 與 When2Call 的 simple sample row 目標。
 - `SEED`：所有排序和抽樣都依賴它，讓重跑結果一致。
-- `SPLIT_RATIOS`、`NEAR_DUP_JACCARD`、`REVIEW_ROWS`：split、near dedup 與人工 review 設定。
+- `SPLIT_RATIOS`、`NEAR_DUP_JACCARD`：split 與 near dedup 設定。
 - `TOKENIZER_IDS`：`stats.py` 要實測的 model tokenizer；改模型只需改這裡，不需重建 corpus。
 - `normalized_path()`、`curated_path()`：避免各 stage 重複拼錯檔名。
 
-第一版最常改的是 quota、seed、tokenizer 清單。若改 near-duplicate threshold，應重新執行
+第一版最常改的是 sample target、seed、tokenizer 清單。若改 near-duplicate threshold，應重新執行
 `curate.py`、`split.py` 和 `stats.py`。
 
 ## `io.py`：小型共用工具
@@ -161,8 +161,8 @@ turn 中分次 call 才算 sequential。
 - `normalize_when2call()`：要求一問一答，輸出 `task_type=tool_decision`，並把規則名稱記在
   `label_method`，方便日後替換 heuristic。
 
-這些分類是可追蹤規則，不等於人工 ground truth；真實分布與 quota shortfall 要看
-`reports/curation.json`。
+這些分類是可追蹤規則，不等於人工 ground truth；simple sample 不使用這些 label，抽樣後的
+自然分布可在 `reports/curation.json` 查看。
 
 ### `run_normalize()`
 
@@ -222,14 +222,14 @@ Tier C / wrong
 
 這是策略最集中的一支程式，但中間結果仍拆成 curated 和 selected 兩層。
 
-### CCNA filter 與 topic
+### CCNA topic metadata
 
 - `normalized_text()`：NFKC、case folding，只保留英數 token，供 dedup 使用。
 - `network_topic()`：計算各 topic keyword 命中數；完全沒命中時放入
   `management_cli_misc`。
-- `is_ccna_troubleshooting()`：嚴格 troubleshooting regex 的布林 helper，主要供測試與檢查。
-- `ccna_candidate_tier()`：先收 strict troubleshooting；沒有 strict keyword 但有 operational/CLI
-  語意時收進 high-recall tier；兩者都沒有就不參與 3,500 抽樣。
+
+CCNA topic 不再是 sampling gate。所有通過 quality/dedup 的 CCNA rows 都會保留；topic 只服務
+報表、near-duplicate grouping 和 group-aware split。
 
 ### Exact 與 near duplicate
 
@@ -248,17 +248,16 @@ dedup，而以 `scenario + failure_type + incident` 建 group。
 
 輸出是每個 source 的 `02_curated/*.jsonl`、`quality_rejected.jsonl` 和初步 report。
 
-### `stratified_sample()` 與 `run_curate()`
+### `deterministic_sample()` 與 `run_curate()`
 
-`stratified_sample()` 先用 `stable_score(seed, source, id)` 做可重現排序，再依 quota 取各 category；
-某類不足時不複製資料，而從尚未選中的其他類別補滿總 target。
+`deterministic_sample()` 只用 `stable_score(seed, source, id)` 排序，然後取前 `target` 筆。它不看
+category、不補 category quota，也不 oversample。
 
-`run_curate()` 的選擇順序就是 V1 配方：完整加入 5G、Telelogs、valid NIKA，對 CCNA、ToolACE、
-When2Call 分層抽樣。最後輸出：
+`run_curate()` 完整加入 5G、Telelogs、CCNA、valid NIKA，只對 ToolACE 與 When2Call 做 simple
+sample。最後輸出：
 
 - `03_selected/selected.jsonl`：要進 split 的完整 mixed corpus。
-- `reports/ccna_review_200.jsonl`：固定且可重現的 200 筆人工 review 樣本。
-- `reports/curation.json`：candidate、selected、category 和 quota shortfall 統計。
+- `reports/curation.json`：selected/category 統計，以及兩個 sample pool 的 available/target/selected。
 
 ## `split.py`：group-aware 80/10/10
 
@@ -282,17 +281,26 @@ When2Call 分層抽樣。最後輸出：
 - `apply_template()`：將 canonical `messages` 和非空 `tools` 傳給 tokenizer；corpus 本身不加
   model special tokens。
 - `_check_render()`：以文字模式 render，再確認每段 message content、每個 called function、tool
-  definition 與 description probe 都存在。這可抓出「函式沒報錯，但 template 默默忽略 tools」的
-  情況。
+  definition 與 description probe 都存在；tool result 可用原文或等價 JSON-escaped 字串呈現。
+  這可抓出「函式沒報錯，但 template 默默忽略 tools」的情況，又不會誤判正常 JSON serialization。
 - `_assistant_tokens()`：優先要求 template 回傳 `{% generation %}` assistant mask；不支援時只
   token 化 assistant content/tool calls 做 estimate，並把採用的方法寫入 report。
 - `_one_tokenizer()`：逐 row 驗證、tokenize、累積 task/source 統計、model max length 超限數、
-  diagnostic/agentic token share 和最多 20 筆 failure examples。
+  diagnostic/agentic token share、依 source/error 分組的 incompatibility，以及最多 20 筆 failure
+  examples。Jinja template 主動拒絕資料時也會逐筆記錄，不會中止整份 report。
 - `run_stats()`：讀回 train/val/test 的全部 rows，依 `TOKENIZER_IDS` 逐個載入 tokenizer；單一模型
-  載入失敗不會遮掉其他模型結果，每測完一個就更新 `token_stats.json`。
+  載入失敗不會遮掉其他模型結果，每測完一個就更新 `token_stats.json`。所有失敗 row 另寫入
+  `template_incompatible.jsonl`，供 controlled comparison 依 ID 精確排除。
 
 所以 model compatibility 的判準不是「模型名稱看起來支援聊天」，而是該 tokenizer template
 實際保留這份 corpus 所需的 messages、tools、tool calls 和 tool results。
+
+## `controlled.py`：所有模型使用相同 row IDs
+
+`run_controlled()` 讀取 template report，確認 `CONTROLLED_TOKENIZER_IDS` 每個模型都完成檢查，
+再排除其中任一模型不相容的 row。它不靠 `parallel` 等 category 猜測，而使用逐筆 template
+實測結果。原本 `network_sft_v1` 不變，交集另寫到 `experiments/controlled_llama_qwen`；
+`excluded.jsonl` 保存每筆排除原因，`manifest.json` 保存模型清單與 split 數量。
 
 ## `pipeline.py` 與 `__init__.py`
 
@@ -304,6 +312,7 @@ run_normalize()
 run_curate()
 run_split()
 run_stats()
+run_controlled()
 ```
 
 因此 debug 時建議單獨執行有問題的 stage；確定整條流程可重跑後，才使用 pipeline 一次跑完。
@@ -316,7 +325,7 @@ run_stats()
 - canonical row 能被 Hugging Face/TRL conversational dataset 接受。
 - When2Call 的 tool-call markup 會變成 structured call，文字回答的規則分類可預期。
 - ToolACE complexity 確實由 messages 計算，terminal tool call 也是合法 SFT target。
-- CCNA troubleshooting/topic filter 和 quota redistribution 不會因重構改變。
+- CCNA topic 只作 metadata；simple sample 在輸入順序改變時仍產生相同結果。
 - 同一個 group 永遠不會跨 split。
 - NIKA 只接受正確且完整的 trace。
 - template boundary 直接傳 messages/tools，並兼容 Transformers v5 的 mapping result。
@@ -342,9 +351,9 @@ rg 'ccna_xxx' data/sft/reports/quality_rejected.jsonl
 rg 'ccna' data/sft/reports/normalize_rejected.jsonl
 ```
 
-要理解「為何沒抽到」時，先看 row 的 `metadata.category/candidate_tier`，再對照
-`curation.json` 的 available、selected 與 quota shortfalls。要理解「為何被分到 test」時，看
-`group_id`；split 是 deterministic allocation，不是人工指定。
+CCNA row 若通過 quality/dedup 就一定會進 selected；ToolACE/When2Call 若沒抽到，可對照
+`curation.json` 的 available、target、selected，並用相同 seed hash 重現排序。要理解「為何被
+分到 test」時看 `group_id`；split 是 deterministic allocation，不是人工指定。
 
 ## 建議閱讀順序
 

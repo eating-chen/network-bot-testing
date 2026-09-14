@@ -4,7 +4,7 @@
 
 - `network_cpt/`：document/text 格式的持續預訓練資料，使用既有 `data/raw`、
   `data/interim`、`data/processed/network_cpt_v1`。
-- `network_sft/`：六來源、約 15k 筆的 Diagnostic/Agentic Mixed SFT V1；使用
+- `network_sft/`：六來源、約 22k 筆的 Diagnostic/Agentic Mixed SFT V1；使用
   model-neutral Hugging Face/TRL `messages + tools` JSONL，只讀寫 `data/sft/`。
 
 本頁以下說明 CPT。SFT 的來源、filter、逐支 Python 執行方式與輸出 schema 請看

@@ -4,12 +4,12 @@ import json
 import logging
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import Any
 
 from network_sft import config
-from network_sft.io import jsonl_rows, setup_logging, utc_now, write_json
+from network_sft.io import jsonl_rows, setup_logging, utc_now, write_json, write_jsonl
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +33,15 @@ def _summary(values: list[int]) -> dict[str, int]:
         "p99": percentile(99),
         "max": max(values),
     }
+
+
+def _error_category(message: str) -> str:
+    dynamic_errors = (
+        "chat_template dropped tool call",
+        "chat_template dropped tool definition",
+        "chat_template dropped schema for",
+    )
+    return next((prefix for prefix in dynamic_errors if message.startswith(prefix)), message)
 
 
 def apply_template(tokenizer: Any, row: dict[str, Any], *, assistant_mask: bool = False) -> Any:
@@ -63,7 +72,8 @@ def _check_render(tokenizer: Any, row: dict[str, Any]) -> None:
     rendered_words = _words(rendered)
     for message in row["messages"]:
         content = message.get("content") or ""
-        if content and content not in rendered:
+        json_content = json.dumps(content, ensure_ascii=False)
+        if content and content not in rendered and json_content not in rendered:
             raise ValueError(f"chat_template dropped {message['role']} content")
         for call in message.get("tool_calls") or []:
             name = call["function"]["name"]
@@ -100,7 +110,10 @@ def _assistant_tokens(tokenizer: Any, row: dict[str, Any], rendered: list[int]) 
     return min(estimate, len(rendered)), "assistant_content_estimate"
 
 
-def _one_tokenizer(tokenizer_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _one_tokenizer(
+    tokenizer_id: str, rows: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    from jinja2.exceptions import TemplateError
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
@@ -111,6 +124,7 @@ def _one_tokenizer(tokenizer_id: str, rows: list[dict[str, Any]]) -> dict[str, A
     source_lengths: defaultdict[str, list[int]] = defaultdict(list)
     source_assistant: defaultdict[str, list[int]] = defaultdict(list)
     methods, failures = defaultdict(int), []
+    failures_by_source, failures_by_error = Counter(), Counter()
     over_model_limit = 0
     for row in rows:
         try:
@@ -125,8 +139,11 @@ def _one_tokenizer(tokenizer_id: str, rows: list[dict[str, Any]]) -> dict[str, A
             methods[method] += 1
             if len(input_ids) > tokenizer.model_max_length:
                 over_model_limit += 1
-        except (KeyError, TypeError, ValueError) as error:
-            failures.append({"id": row["id"], "source": row["source"], "error": str(error)})
+        except (KeyError, TemplateError, TypeError, ValueError) as error:
+            reason = str(error)
+            failures.append({"id": row["id"], "source": row["source"], "error": reason})
+            failures_by_source[row["source"]] += 1
+            failures_by_error[_error_category(reason)] += 1
     diagnostic_tokens = sum(lengths["diagnostic"])
     agentic_tokens = sum(sum(values) for key, values in lengths.items() if key != "diagnostic")
     diagnostic_assistant = sum(assistant["diagnostic"])
@@ -141,9 +158,11 @@ def _one_tokenizer(tokenizer_id: str, rows: list[dict[str, Any]]) -> dict[str, A
             "agentic_percent": round(agentic / total * 100, 2) if total else 0,
         }
 
-    return {
+    report = {
         "compatible_rows": sum(map(len, lengths.values())),
         "incompatible_rows": len(failures),
+        "incompatible_by_source": dict(failures_by_source),
+        "incompatible_by_error": dict(failures_by_error),
         "failure_examples": failures[:20],
         "assistant_token_methods": dict(methods),
         "model_max_length": tokenizer.model_max_length,
@@ -159,6 +178,7 @@ def _one_tokenizer(tokenizer_id: str, rows: list[dict[str, Any]]) -> dict[str, A
         "token_share_by_capability": shares(diagnostic_tokens, agentic_tokens),
         "assistant_token_share_by_capability": shares(diagnostic_assistant, agentic_assistant),
     }
+    return report, failures
 
 
 def run_stats() -> dict[str, Any]:
@@ -170,13 +190,18 @@ def run_stats() -> dict[str, Any]:
     for split in config.SPLIT_RATIOS:
         rows.extend(jsonl_rows(config.FINAL_DIR / f"{split}.jsonl"))
     report = {"created_at": utc_now(), "rows": len(rows), "tokenizers": {}}
+    incompatibilities = []
     for tokenizer_id in config.TOKENIZER_IDS:
         try:
-            report["tokenizers"][tokenizer_id] = _one_tokenizer(tokenizer_id, rows)
+            tokenizer_report, failures = _one_tokenizer(tokenizer_id, rows)
+            report["tokenizers"][tokenizer_id] = tokenizer_report
+            for failure in failures:
+                incompatibilities.append({"tokenizer_id": tokenizer_id, **failure})
         except (OSError, TypeError, ValueError) as error:
             report["tokenizers"][tokenizer_id] = {"load_error": str(error)}
         write_json(config.REPORTS_DIR / "token_stats.json", report)
         LOGGER.info("template check: %s", tokenizer_id)
+    write_jsonl(config.REPORTS_DIR / "template_incompatible.jsonl", incompatibilities)
     return report
 
 
