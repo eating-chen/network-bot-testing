@@ -1,0 +1,3 @@
+# Add one canonical id, root_case_id, or group_id per line before building B.
+# These cases are excluded from every training artifact.
+
